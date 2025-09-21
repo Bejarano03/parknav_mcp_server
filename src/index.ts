@@ -8,6 +8,7 @@ import fs from "fs";
 import dotenv from "dotenv";
 import { Pool } from "pg";
 import fetch from "node-fetch";
+import osmtogeojson from "osmtogeojson";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -65,11 +66,19 @@ interface ParkingInfo {
 
 async function queryGoogleForParking(neighborhood: string): Promise<any> {
   const query = `parking near ${neighborhood}, Seattle, WA`;
-  const url = `https://serpapi.com/search.json?q=${encodeURIComponent(query)}&location=Seattle&api_key=${process.env.SERPAPI_API_KEY}`;
+  const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(query)}&location=Seattle&api_key=${process.env.SERPAPI_API_KEY}`;
   
-  const response = await fetch(url);
-  const data = await response.json();
-  return data;
+  try {
+    const response = await fetch(url);
+    if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+    }
+    const data = await response.json();
+    return data;
+  } catch (error) {
+    console.error("Error fetching data from SerpApi:", error);
+    return null; // Return null on failure to handle gracefully.
+  }
 }
 
 function parseParkingDetails(raw: any, neighborhood: string): ParkingInfo[] {
@@ -95,10 +104,33 @@ function extractHours(snippet: string): string | null {
   return match ? match[1].trim() : null;
 }
 
+// Define a new interface for the properties of your parking GeoJSON features
+interface ParkingProperties {
+  overpass_id: number;
+  latitude: number;
+  longitude: number;
+  name: string | null;
+  amenity: string | null;
+  source: string;
+  retrieved_at: string;
+  confidence: number;
+  other_tags: any; // Use a more specific type if possible
+}
+
+// Define a new Zod schema for the GeoJSON resource type
+const GeoJsonResourceSchema = z.object({
+  type: z.literal("resource"),
+  resource: z.object({
+    text: z.string(),
+    uri: z.string(),
+    mimeType: z.string().optional(),
+  }),
+});
+
+
 // -------------------------------------------------------------
 // MCP Server Tools
 // -------------------------------------------------------------
-// Fix: Use a raw object literal (ZodRawShape) for the schema
 server.tool(
   "speechToText",
   "Convert base64 audio into text using OpenAI Whisper",
@@ -110,7 +142,6 @@ server.tool(
     const buffer = Buffer.from(audioBase64, "base64");
     const tmpFilePath = `/tmp/audio.${filetype}`;
     await fs.promises.writeFile(tmpFilePath, buffer);
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const transcription = await openai.audio.transcriptions.create({
       model: "whisper-1",
       file: fs.createReadStream(tmpFilePath),
@@ -121,7 +152,6 @@ server.tool(
   }
 );
 
-// Fix: Use a raw object literal (ZodRawShape) for the schema
 server.tool(
   "textToSpeech",
   "Convert text into speech using OpenAI TTS",
@@ -131,7 +161,6 @@ server.tool(
   },
   async ({ text, voice }) => {
     const outputFile = `/tmp/output.mp3`;
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
     const response = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice,
@@ -145,7 +174,6 @@ server.tool(
   }
 );
 
-// Fix: Use a raw object literal (ZodRawShape) for the schema
 server.tool(
   "saveParkingInfo",
   "Fetches parking information from Google Maps and saves it to the database.",
@@ -188,11 +216,173 @@ server.tool(
       return {
         content: [{ type: "text", text: `Successfully saved ${parsedData.length} parking spots for ${neighborhood}.` }],
       };
-    } catch (error) {
+    } catch (error: unknown) {
+      let errorMessage = "An unknown error occurred while saving parking data.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      }
       console.error("Error in saveParkingInfo tool:", error);
       return {
-        content: [{ type: "text", text: "An error occurred while saving parking data." }],
+        content: [{ type: "text", text: `An error occurred while saving parking data: ${errorMessage}` }],
       };
+    }
+  }
+);
+
+server.tool(
+  "fetchOverpassData",
+  "Fetches parking data from Overpass API and saves it to a structured database table.",
+  {
+    lat: z.number().describe("Latitude for the query center point."),
+    lon: z.number().describe("Longitude for the query center point."),
+    radius: z.number().default(500).describe("Radius in meters for the search."),
+  },
+  async ({ lat, lon, radius }) => {
+    const client = await pool.connect();
+    try {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS enriched_parking (
+          id SERIAL PRIMARY KEY,
+          overpass_id BIGINT UNIQUE,
+          latitude DOUBLE PRECISION,
+          longitude DOUBLE PRECISION,
+          name TEXT,
+          amenity TEXT,
+          source TEXT,
+          retrieved_at TIMESTAMPTZ,
+          confidence DOUBLE PRECISION,
+          other_tags JSONB
+        );
+      `);
+
+      const overpassQuery = `[out:json][timeout:25]; nwr["amenity"="parking"](around:${radius},${lat},${lon}); out tags geom;`;
+      const response = await fetch("https://overpass-api.de/api/interpreter", {
+        method: "POST",
+        body: `data=${encodeURIComponent(overpassQuery)}`,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const rawOverpassData = await response.json();
+      const geojsonData = osmtogeojson(rawOverpassData);
+
+      const source = "https://overpass-api.de/api/interpreter";
+      const retrievedAt = new Date().toISOString();
+      const confidence = 0.95;
+
+      await client.query("BEGIN");
+      
+      const insertQuery = `
+        INSERT INTO enriched_parking (overpass_id, latitude, longitude, name, amenity, source, retrieved_at, confidence, other_tags)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        ON CONFLICT (overpass_id) DO UPDATE SET
+          latitude = EXCLUDED.latitude,
+          longitude = EXCLUDED.longitude,
+          name = EXCLUDED.name,
+          amenity = EXCLUDED.amenity,
+          source = EXCLUDED.source,
+          retrieved_at = EXCLUDED.retrieved_at,
+          confidence = EXCLUDED.confidence,
+          other_tags = EXCLUDED.other_tags;
+      `;
+
+      for (const feature of geojsonData.features) {
+        const { id, properties, geometry } = feature;
+        
+        if (!geometry || geometry.type !== "Point" || !geometry.coordinates) continue;
+
+        const [longitude, latitude] = geometry.coordinates;
+        const { name, amenity, ...otherTags } = properties as { name?: string, amenity?: string, [key: string]: any };
+
+        await client.query(insertQuery, [
+          id,
+          latitude,
+          longitude,
+          name || null,
+          amenity || null,
+          source,
+          retrievedAt,
+          confidence,
+          otherTags,
+        ]);
+      }
+
+      await client.query("COMMIT");
+
+      return {
+        content: [{ type: "text", text: `✅ Successfully fetched and saved ${geojsonData.features.length} parking spots to the database.` }],
+      };
+
+    } catch (error: unknown) {
+      await client.query("ROLLBACK");
+      let errorMessage = "An unknown error occurred.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      }
+      console.error("❌ Error in fetchOverpassData tool:", error);
+      return {
+        content: [{ type: "text", text: `❌ An error occurred while fetching parking data: ${errorMessage}` }],
+      };
+    } finally {
+      client.release();
+    }
+  }
+);
+
+server.tool(
+  "getParkingDataForFrontend",
+  "Retrieves parking data from the database and returns it as a GeoJSON object.",
+  {},
+  async () => {
+    const client = await pool.connect();
+    try {
+      const result = await client.query("SELECT * FROM enriched_parking");
+      const parkingRows = result.rows;
+
+      const geojsonFeatures = parkingRows.map(row => {
+        const { latitude, longitude, ...properties } = row;
+        
+        return {
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: [longitude, latitude],
+          },
+          properties,
+        };
+      });
+
+      const geojson = {
+        type: "FeatureCollection",
+        features: geojsonFeatures,
+      };
+
+      const geojsonString = JSON.stringify(geojson, null, 2);
+
+      return {
+        content: [{
+          type: "resource",
+          resource: {
+            text: "parking_locations.geojson",
+            uri: "data:application/json;base64," + Buffer.from(geojsonString).toString("base64"),
+            mimeType: "application/geo+json"
+          },
+        }],
+      };
+    } catch (error: unknown) {
+      let errorMessage = "An unknown error occurred while retrieving parking data.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      }
+      console.error("❌ Error in getParkingDataForFrontend tool:", error);
+      return {
+        content: [{ type: "text", text: `❌ An error occurred while retrieving parking data: ${errorMessage}` }],
+      };
+    } finally {
+      client.release();
     }
   }
 );
